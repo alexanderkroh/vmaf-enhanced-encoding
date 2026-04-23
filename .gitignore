@@ -1,0 +1,41 @@
+cd ~/Projects/VMAF-enhanced-encoding
+
+# Create .gitignore
+cat > .gitignore << 'EOF'
+# Output directories
+eval_output/
+eval_output_*/
+
+# Training data (large, generated)
+records.jsonl
+records_test.jsonl
+*.jsonl
+
+# Source video files
+*.mov
+*.mp4
+*.mxf
+*.mkv
+*.avi
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
+
+# Debug / scratch scripts
+debug.py
+
+# Large model files
+*.pkl
+*.joblib
+*.h5
+EOF
+
+git init
+git add video_quality_pipeline.py plot_rd.py .gitignore
+git status
