@@ -75,11 +75,13 @@ try:
         RDCurveModel,
         EvalConfig,
         ChunkInfo,
+        LaneSpec,
         DynamicOptimizerConfig,
         probe_color_metadata,
         extract_shot_features,
         build_chunks,
         validate_source,
+        encode_multilane_with_vmaf,
     )
     HAS_PIPELINE = True
 except ImportError as e:
@@ -776,6 +778,108 @@ def print_ladder_report(result: LadderResult) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Ladder Encoding — multi-lane parallel encode with in-loop VMAF
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _encode_ladder_renditions(
+    result:     LadderResult,
+    output_dir: str,
+    args,
+) -> None:
+    """
+    Encode all ladder renditions using multi-lane parallel encoding with
+    in-loop VMAF measurement (Meta FFmpeg 8.0 architecture).
+
+    All renditions share a single decode pass. Encoders run in parallel
+    threads. VMAF is measured inline without a separate pass.
+
+    For each rung, per-chunk CRF assignments from the ladder definition
+    are used — different shots within a rung use different CRF values to
+    maintain consistent perceptual quality.
+
+    Output structure:
+        output_dir/
+            {rung_label}/
+                chunk_0000.mp4
+                chunk_0001.mp4
+                ...
+                vmaf_0000.json
+                vmaf_0001.json
+                ...
+                media.m3u8  (updated with real segment references)
+    """
+    cfg = EvalConfig(reference=result.source_path)
+    cfg.ffmpeg_path  = args.ffmpeg_path
+    cfg.ffprobe_path = args.ffprobe_path
+    cfg.codec        = args.codec
+    cfg.preset       = args.preset
+    cfg.color_meta   = probe_color_metadata(cfg)
+
+    # Rebuild chunks to get ChunkInfo objects with timing
+    do_cfg = DynamicOptimizerConfig(
+        scene_threshold    = args.scene_threshold,
+        min_chunk_duration = args.min_chunk_duration,
+        detector           = args.detector,
+        chunk_dir          = os.path.join(output_dir, "chunks"),
+    )
+    chunks = build_chunks(cfg, do_cfg)
+
+    log.info(
+        "Encoding %d rungs × %d chunks = %d total encodes (multi-lane per chunk)",
+        len(result.rungs), len(chunks), len(result.rungs) * len(chunks),
+    )
+
+    for chunk_idx, chunk in enumerate(chunks):
+        log.info(
+            "[Chunk %04d/%04d]  %.2fs–%.2fs  (%d frames)",
+            chunk_idx, len(chunks) - 1,
+            chunk.start_time, chunk.end_time, chunk.frame_count,
+        )
+
+        # Build one LaneSpec per rung for this chunk
+        lanes = []
+        for rung in result.rungs:
+            rung_dir = os.path.join(output_dir, rung.label)
+            os.makedirs(rung_dir, exist_ok=True)
+
+            chunk_crf = rung.per_chunk_crfs.get(chunk.index, 23)
+
+            lane = LaneSpec(
+                crf           = chunk_crf,
+                output_path   = os.path.join(
+                    rung_dir, f"chunk_{chunk_idx:04d}.mp4"
+                ),
+                vmaf_log_path = os.path.join(
+                    rung_dir, f"vmaf_{chunk_idx:04d}.json"
+                ),
+                width  = rung.resolution_width,
+                height = rung.resolution_height,
+            )
+            lanes.append(lane)
+
+        # Encode all rungs for this chunk in one multi-lane pass with in-loop VMAF
+        outcomes = encode_multilane_with_vmaf(
+            cfg             = cfg,
+            lanes           = lanes,
+            source_override = result.source_path,
+        )
+
+        # Log per-rung results
+        for lane, rung in zip(lanes, result.rungs):
+            outcome = outcomes.get(lane.label, {})
+            vmaf    = outcome.get("vmaf")
+            br      = outcome.get("bitrate_kbps", 0)
+            log.info(
+                "  %-20s  CRF=%-3d  VMAF=%-6s  %.0f kbps",
+                rung.label, lane.crf,
+                f"{vmaf:.2f}" if vmaf is not None else "—",
+                br,
+            )
+
+    log.info("=== Ladder encoding complete ===")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -853,9 +957,8 @@ def main():
     print_ladder_report(result)
 
     if args.encode:
-        log.info("--encode flag set — encoding all renditions...")
-        log.warning("Encoding not yet implemented in this version. "
-                    "Use ladder.json per_chunk_crfs to drive your encoding pipeline.")
+        log.info("--encode flag set — encoding all renditions with multi-lane parallel encoder...")
+        _encode_ladder_renditions(result, args.output_dir, args)
 
 
 if __name__ == "__main__":

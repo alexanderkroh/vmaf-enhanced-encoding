@@ -272,6 +272,463 @@ def encode_video(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Multi-Lane Encoding  (Meta FFmpeg 8.0 parallel encoder architecture)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Meta's March 2026 engineering post describes two features now upstream in
+# FFmpeg 8.0 that were previously only in their internal fork:
+#
+#   1. Threaded multi-lane encoding — multiple encoders run in parallel sharing
+#      a single decode pass.  Previously encoders ran serially per-frame even
+#      within a single FFmpeg command.  The refactoring landed in FFmpeg 6.0
+#      with finishing touches in 8.0.
+#
+#   2. In-loop quality metrics — a decoder is inserted after each encoder lane,
+#      its frames compared against the pre-encode reference, producing VMAF /
+#      PSNR / SSIM scores per lane in real time without a separate pass.
+#
+# encode_multilane() implements (1): one decode pass → N parallel encoders.
+# encode_multilane_with_vmaf() implements (1)+(2): one decode pass → N
+# parallel encoders → N inline decoders → N VMAF measurements.
+#
+# Both functions accept the same EvalConfig as encode_video() and reuse all
+# existing helper functions for quality flags, presets, pixel formats, and
+# colour metadata.  They are drop-in replacements for the per-CRF encode loop
+# in run_pipeline() and _process_chunk().
+#
+# Filter graph topology (4-lane CRF sweep example):
+#
+#   Input → split=4 ─┬─ scale → encoder_0 → output_0.mp4
+#                    ├─ scale → encoder_1 → output_1.mp4
+#                    ├─ scale → encoder_2 → output_2.mp4
+#                    └─ scale → encoder_3 → output_3.mp4
+#
+# With in-loop VMAF (encode_multilane_with_vmaf):
+#
+#   Input → split=4 ─┬─ scale → encoder_0 ─┬─ output_0.mp4
+#           split=4  │                       └─ decode → [dist_0][ref_0] → libvmaf → vmaf_0.json
+#                    ├─ scale → encoder_1 ─┬─ output_1.mp4
+#                    │                     └─ decode → [dist_1][ref_1] → libvmaf → vmaf_1.json
+#                    ...
+#
+# IMPORTANT: In-loop VMAF requires FFmpeg 7.0+ for the enc/dec filter
+# capability.  The function checks for this and falls back to encode_multilane()
+# + sequential VMAF if the FFmpeg version is < 7.0.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LaneSpec:
+    """
+    Specification for a single encoding lane in a multi-lane encode.
+
+    Each lane encodes the same source at a different CRF or bitrate,
+    optionally at a different resolution.
+    """
+    crf:            Optional[int]   = None   # CRF value (mutually exclusive with bitrate_kbps)
+    bitrate_kbps:   Optional[float] = None   # target bitrate (mutually exclusive with crf)
+    output_path:    str             = ""     # output file path
+    vmaf_log_path:  str             = ""     # path for VMAF JSON log (in-loop mode only)
+    width:          Optional[int]   = None   # output width  (None = source width)
+    height:         Optional[int]   = None   # output height (None = source height)
+
+    @property
+    def label(self) -> str:
+        if self.crf is not None:
+            return f"crf{self.crf}"
+        if self.bitrate_kbps is not None:
+            return f"{int(self.bitrate_kbps)}kbps"
+        return "unknown"
+
+
+def _ffmpeg_version_tuple(ffmpeg_path: str) -> tuple:
+    """Return (major, minor) FFmpeg version as integers, or (0, 0) on failure."""
+    try:
+        r = subprocess.run(
+            [ffmpeg_path, "-version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            if line.startswith("ffmpeg version"):
+                # "ffmpeg version 8.0.1 ..."  or  "ffmpeg version N-12345-g..."
+                parts = line.split()
+                if len(parts) >= 3:
+                    ver = parts[2].split(".")
+                    try:
+                        return (int(ver[0]), int(ver[1]) if len(ver) > 1 else 0)
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def _build_normalise_chain() -> str:
+    """Return the HDR PQ→linear→BT.709 zscale chain for inline use."""
+    return (
+        "zscale=t=linear:npl=203,"
+        "format=gbrpf32le,"
+        "zscale=tin=linear:t=bt709:p=bt709:m=bt709:r=tv,"
+        "format=yuv420p"
+    )
+
+
+def encode_multilane(
+    cfg:    "EvalConfig",
+    lanes:  list,           # list[LaneSpec]
+    source_override: str = "",   # override cfg.reference (for chunk sweeps)
+) -> dict:
+    """
+    Encode multiple CRF or bitrate variants in a single FFmpeg pass.
+
+    Decodes the source once and fans out to N parallel encoder instances —
+    the architecture Meta upstreamed into FFmpeg 8.0.  Encoders run in
+    parallel threads sharing the decoded frame buffer rather than serially.
+
+    Parameters
+    ----------
+    cfg    : EvalConfig with codec, preset, hw_accel, color_meta etc.
+    lanes  : list of LaneSpec — one per output rendition.
+    source_override : if set, use this path as -i instead of cfg.reference.
+                      Used by the chunk sweep to point at the chunk clip.
+
+    Returns
+    -------
+    dict mapping lane label → True/False (success/failure per lane).
+    """
+    if not lanes:
+        return {}
+
+    source = source_override or cfg.reference
+    hw     = cfg.hw_accel
+    encoder = _resolve_encoder(cfg.codec, hw)
+    n = len(lanes)
+
+    # ── Build filter_complex ─────────────────────────────────────────────────
+    # [0:v] → split=N → [v0][v1]...[vN-1]
+    # Each branch: optional scale → encoder flags applied as output options
+    filter_parts = []
+    split_labels = "".join(f"[v{i}]" for i in range(n))
+    filter_parts.append(f"[0:v]split={n}{split_labels}")
+
+    # Scale branches — only added when lane requests a different resolution
+    for i, lane in enumerate(lanes):
+        src_label = f"[v{i}]"
+        if lane.width and lane.height:
+            out_label = f"[vscaled{i}]"
+            filter_parts.append(
+                f"{src_label}scale={lane.width}:{lane.height}{out_label}"
+            )
+        # If no scale, the [v{i}] label feeds the encoder directly via -map
+
+    filter_complex = ";".join(filter_parts) if len(filter_parts) > 1 else filter_parts[0]
+
+    # ── Assemble FFmpeg command ───────────────────────────────────────────────
+    cmd = [cfg.ffmpeg_path, "-y"]
+    cmd += _hwaccel_flags(hw)
+    cmd += ["-i", source]
+    cmd += ["-filter_complex", filter_complex]
+
+    fps_num = (cfg.color_meta or {}).get("fps_num", 0)
+
+    for i, lane in enumerate(lanes):
+        # Map the correct output from the filter graph
+        if lane.width and lane.height:
+            cmd += ["-map", f"[vscaled{i}]"]
+        else:
+            cmd += ["-map", f"[v{i}]"]
+
+        cmd += ["-an"]                              # no audio
+        cmd += ["-c:v", encoder]
+        cmd += _container_tag_flags(cfg.codec, encoder)
+        cmd += _quality_flags(cfg.codec, hw, lane.crf, lane.bitrate_kbps)
+        cmd += _preset_flags(cfg.codec, hw, cfg.preset)
+        cmd += _resolve_pix_fmt(cfg.color_meta, encoder, cfg.force_pix_fmt)
+        cmd += _build_color_flags(cfg.color_meta, encoder, cfg.preserve_hdr)
+
+        if cfg.keyframe_interval > 0:
+            cmd += ["-g", str(cfg.keyframe_interval)]
+            if hw not in ("nvenc", "videotoolbox", "qsv", "amf"):
+                cmd += ["-keyint_min", str(cfg.keyframe_interval)]
+
+        if cfg.threads > 0:
+            cmd += ["-threads", str(cfg.threads)]
+
+        if fps_num > 0 and lane.output_path.lower().endswith(".mp4"):
+            cmd += ["-video_track_timescale", str(fps_num)]
+
+        cmd.append(lane.output_path)
+
+    log.info(
+        "Multi-lane encode: %d lanes [%s] → %s …",
+        n,
+        ", ".join(l.label for l in lanes),
+        os.path.dirname(lanes[0].output_path),
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    outcomes = {}
+    if result.returncode != 0:
+        log.error("Multi-lane FFmpeg encode failed:\n%s", result.stderr[-3000:])
+        for lane in lanes:
+            outcomes[lane.label] = False
+        return outcomes
+
+    # Verify each output file was created
+    for lane in lanes:
+        ok = os.path.exists(lane.output_path) and os.path.getsize(lane.output_path) > 0
+        outcomes[lane.label] = ok
+        if ok:
+            log.info("  %-12s → %s", lane.label, lane.output_path)
+        else:
+            log.error("  %-12s → MISSING output %s", lane.label, lane.output_path)
+
+    return outcomes
+
+
+def encode_multilane_with_vmaf(
+    cfg:    "EvalConfig",
+    lanes:  list,           # list[LaneSpec] — each must have vmaf_log_path set
+    source_override: str = "",
+) -> dict:
+    """
+    Encode multiple CRF/bitrate variants with in-loop VMAF measurement.
+
+    Implements the Meta in-loop quality metric architecture: a decoder is
+    inserted after each encoder, its frames compared against the pre-encode
+    reference frames, producing VMAF (and optionally PSNR/SSIM) scores per
+    lane without a separate measurement pass.
+
+    Requires FFmpeg 7.0+ for in-loop decode support.  Falls back to
+    encode_multilane() + sequential run_ffmpeg_metrics() on older versions.
+
+    Filter graph topology (2-lane example, SDR):
+    ┌─ Input ──────────────────────────────────────────────────────────────┐
+    │ [0:v] → split=2 → [v0][ref0]                                         │
+    │                     [ref1]                                            │
+    │ Encode branch 0: [v0] → encoder_0 → [enc0] → output_0.mp4           │
+    │                                     [enc0] → dec0 → [dist0]          │
+    │ VMAF 0:          [dist0][ref0] → libvmaf → vmaf_0.json               │
+    │ Encode branch 1: similar ...                                          │
+    └──────────────────────────────────────────────────────────────────────┘
+
+    For HDR sources the normalise chain is applied to both [distN] and [refN]
+    before libvmaf, matching the existing run_ffmpeg_metrics() HDR behaviour.
+
+    Parameters
+    ----------
+    cfg   : EvalConfig — hdr_vmaf_normalise, vmaf_model, enable_psnr/ssim etc.
+    lanes : list[LaneSpec] — each must have output_path AND vmaf_log_path set.
+    source_override : path override for chunk sweep use.
+
+    Returns
+    -------
+    dict mapping lane label → dict with keys:
+        'encode_ok'  : bool
+        'vmaf'       : float or None
+        'psnr'       : float or None
+        'ssim'       : float or None
+        'bitrate_kbps': float
+    """
+    if not lanes:
+        return {}
+
+    # ── Version check — in-loop decode requires FFmpeg 7.0+ ──────────────────
+    major, minor = _ffmpeg_version_tuple(cfg.ffmpeg_path)
+    if major < 7:
+        log.warning(
+            "In-loop VMAF requires FFmpeg 7.0+ (found %d.%d). "
+            "Falling back to encode_multilane() + sequential VMAF.", major, minor,
+        )
+        encode_multilane(cfg, lanes, source_override=source_override)
+        results = {}
+        for lane in lanes:
+            ok = os.path.exists(lane.output_path)
+            vmaf_data = {}
+            if ok and lane.vmaf_log_path and cfg.enable_vmaf:
+                vmaf_data = run_ffmpeg_metrics(cfg, lane.output_path, lane.vmaf_log_path)
+            br = probe_bitrate(cfg, lane.output_path) if ok else 0.0
+            results[lane.label] = {
+                "encode_ok":    ok,
+                "vmaf":         vmaf_data.get("vmaf"),
+                "psnr":         vmaf_data.get("psnr"),
+                "ssim":         vmaf_data.get("ssim"),
+                "bitrate_kbps": br,
+            }
+        return results
+
+    source  = source_override or cfg.reference
+    hw      = cfg.hw_accel
+    encoder = _resolve_encoder(cfg.codec, hw)
+    n       = len(lanes)
+    hdr     = cfg.hdr_vmaf_normalise
+    normalise = _build_normalise_chain()
+
+    # ── Build libvmaf filter string (shared options, lane-specific log path) ──
+    def _vmaf_filter(log_path: str) -> str:
+        opts = f"log_fmt=json:log_path={log_path}"
+        if cfg.vmaf_model:
+            opts += f":model=path={cfg.vmaf_model}"
+        if cfg.enable_psnr:
+            opts += ":feature=name=psnr"
+        if cfg.enable_ssim:
+            opts += ":feature=name=float_ssim"
+        return f"libvmaf={opts}"
+
+    # ── Filter graph ─────────────────────────────────────────────────────────
+    #
+    # We need 2N outputs from the input:
+    #   N encoder inputs:  [v0]..[vN-1]
+    #   N reference copies for VMAF: [ref0]..[refN-1]
+    #
+    # split=2N → [v0][ref0][v1][ref1]...[vN-1][refN-1]
+    #
+    filter_parts = []
+    split_labels = "".join(f"[v{i}][ref{i}]" for i in range(n))
+    filter_parts.append(f"[0:v]split={2*n}{split_labels}")
+
+    for i, lane in enumerate(lanes):
+        # Scale branch (optional)
+        if lane.width and lane.height:
+            filter_parts.append(f"[v{i}]scale={lane.width}:{lane.height}[vs{i}]")
+            enc_in = f"[vs{i}]"
+        else:
+            enc_in = f"[v{i}]"
+
+        # Encoder → enc_out label
+        enc_out = f"[enc{i}]"
+
+        # The enc filter wraps the encoder and exposes a decoded output.
+        # Syntax: [in]enc=c=ENCODER:OPTION=VALUE[enc_out][dec_out]
+        # where dec_out is the decoded (post-compress) frames for VMAF.
+        quality_flags = _quality_flags(cfg.codec, hw, lane.crf, lane.bitrate_kbps)
+        preset_flags  = _preset_flags(cfg.codec, hw, cfg.preset)
+
+        # Build encoder option string for the enc filter
+        enc_opts = f"c={encoder}"
+        # Quality
+        for j in range(0, len(quality_flags) - 1, 2):
+            k = quality_flags[j].lstrip("-").replace(":", "_")
+            enc_opts += f":{k}={quality_flags[j+1]}"
+        # Preset
+        for j in range(0, len(preset_flags) - 1, 2):
+            k = preset_flags[j].lstrip("-").replace(":", "_")
+            enc_opts += f":{k}={preset_flags[j+1]}"
+
+        dec_out = f"[dec{i}]"
+        filter_parts.append(f"{enc_in}enc={enc_opts}{enc_out}{dec_out}")
+
+        # VMAF branch — apply HDR normalisation if needed
+        if hdr:
+            filter_parts.append(f"{dec_out}{normalise}[dist_n{i}]")
+            filter_parts.append(f"[ref{i}]{normalise}[ref_n{i}]")
+            filter_parts.append(
+                f"[dist_n{i}][ref_n{i}]{_vmaf_filter(lane.vmaf_log_path)}"
+            )
+        else:
+            bit_depth = (cfg.color_meta or {}).get("bit_depth", 8)
+            if bit_depth > 8:
+                filter_parts.append(f"{dec_out}format=yuv420p[dist_8{i}]")
+                filter_parts.append(f"[ref{i}]format=yuv420p[ref_8{i}]")
+                filter_parts.append(
+                    f"[dist_8{i}][ref_8{i}]{_vmaf_filter(lane.vmaf_log_path)}"
+                )
+            else:
+                filter_parts.append(
+                    f"{dec_out}[ref{i}]{_vmaf_filter(lane.vmaf_log_path)}"
+                )
+
+    filter_complex = ";".join(filter_parts)
+
+    # ── Assemble FFmpeg command ───────────────────────────────────────────────
+    fps_num = (cfg.color_meta or {}).get("fps_num", 0)
+    cmd = [cfg.ffmpeg_path, "-y"]
+    cmd += _hwaccel_flags(hw)
+    cmd += ["-i", source]
+    cmd += ["-filter_complex", filter_complex]
+
+    for i, lane in enumerate(lanes):
+        cmd += ["-map", f"[enc{i}]"]
+        cmd += ["-c:v", "copy"]         # stream copy — already encoded by enc filter
+        cmd += _container_tag_flags(cfg.codec, encoder)
+        cmd += _build_color_flags(cfg.color_meta, encoder, cfg.preserve_hdr)
+        cmd += _resolve_pix_fmt(cfg.color_meta, encoder, cfg.force_pix_fmt)
+
+        if fps_num > 0 and lane.output_path.lower().endswith(".mp4"):
+            cmd += ["-video_track_timescale", str(fps_num)]
+
+        cmd.append(lane.output_path)
+
+    log_prefix = "(HDR PQ→linear→BT.709 normalisation) " if hdr else ""
+    log.info(
+        "Multi-lane encode + in-loop VMAF %s: %d lanes [%s] …",
+        log_prefix, n, ", ".join(l.label for l in lanes),
+    )
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # ── Parse results ─────────────────────────────────────────────────────────
+    outcomes = {}
+
+    if result.returncode != 0:
+        log.warning(
+            "In-loop VMAF encode failed (returncode=%d). "
+            "Retrying with encode_multilane() + sequential VMAF.",
+            result.returncode,
+        )
+        log.debug("FFmpeg stderr:\n%s", result.stderr[-3000:])
+        # Graceful fallback to two-pass approach
+        encode_multilane(cfg, lanes, source_override=source_override)
+        for lane in lanes:
+            ok = os.path.exists(lane.output_path)
+            vmaf_data = {}
+            if ok and lane.vmaf_log_path and cfg.enable_vmaf:
+                vmaf_data = run_ffmpeg_metrics(cfg, lane.output_path, lane.vmaf_log_path)
+            br = probe_bitrate(cfg, lane.output_path) if ok else 0.0
+            outcomes[lane.label] = {
+                "encode_ok":    ok,
+                "vmaf":         vmaf_data.get("vmaf"),
+                "psnr":         vmaf_data.get("psnr"),
+                "ssim":         vmaf_data.get("ssim"),
+                "bitrate_kbps": br,
+            }
+        return outcomes
+
+    for lane in lanes:
+        encode_ok = (
+            os.path.exists(lane.output_path)
+            and os.path.getsize(lane.output_path) > 0
+        )
+        vmaf_data = {}
+        if encode_ok and lane.vmaf_log_path and os.path.exists(lane.vmaf_log_path):
+            try:
+                vmaf_data = parse_vmaf_log(lane.vmaf_log_path)
+            except Exception as e:
+                log.warning("Could not parse VMAF log %s: %s", lane.vmaf_log_path, e)
+
+        br = probe_bitrate(cfg, lane.output_path) if encode_ok else 0.0
+
+        vmaf_score = vmaf_data.get("vmaf")
+        log.info(
+            "  %-12s  encode_ok=%-5s  VMAF=%-6s  %.0f kbps",
+            lane.label,
+            str(encode_ok),
+            f"{vmaf_score:.2f}" if vmaf_score is not None else "—",
+            br,
+        )
+
+        outcomes[lane.label] = {
+            "encode_ok":    encode_ok,
+            "vmaf":         vmaf_score,
+            "psnr":         vmaf_data.get("psnr"),
+            "ssim":         vmaf_data.get("ssim"),
+            "bitrate_kbps": br,
+        }
+
+    return outcomes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Probe
 # ──────────────────────────────────────────────────────────────────────────────
 
