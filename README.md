@@ -58,7 +58,11 @@ PySceneDetect identifies shot boundaries. Each chunk gets an independent CRF swe
 
 ### HDR VMAF Normalisation
 
-VMAF was designed for SDR content. Applied directly to HDR (PQ-encoded) pixel values it produces scores in the 5-30 range for well-encoded HDR content — physically meaningless. The pipeline automatically detects HDR sources via `color_transfer` metadata and applies PQ→linear→BT.709 normalisation before scoring:
+Two approaches exist for measuring VMAF on HDR content:
+
+**1. HDR-specific VMAF models** — Netflix has developed VMAF models trained on HDR content that operate natively in the PQ domain. The `vmaf_4k_v0.6.1` model included with libvmaf provides improved 4K accuracy but is still fundamentally an SDR-trained model. Netflix's dedicated HDR VMAF model, which scores directly against PQ-encoded references without tone mapping, is used internally but is not part of the standard public libvmaf distribution.
+
+**2. PQ→BT.709 normalisation (this pipeline)** — the most widely accessible approach given current libvmaf distributions. Tone-maps the source and encoded files from PQ to a display-referred BT.709 signal before running the standard VMAF model:
 
 ```
 Source TRC: smpte2084 (PQ) detected
@@ -68,7 +72,9 @@ Source TRC: smpte2084 (PQ) detected
 → Scores are perceptually meaningful and internally consistent
 ```
 
-HDR normalisation propagates explicitly through the per-chunk processing pipeline — stream-copy chunk files often lose `color_trc` metadata, which would cause the re-probe in `_auto_configure_metrics` to miss the HDR flag. This was a diagnosed and fixed production bug.
+The normalisation approach produces scores that are reliable for comparing encodes against each other on the same source but are not directly comparable to SDR VMAF scores — a 93 VMAF on normalised HDR content and a 93 VMAF on native SDR content are not equivalent. The run manifest records which approach was used so results are never ambiguously interpreted.
+
+The pipeline auto-detects HDR via `color_transfer` metadata (`smpte2084`, `arib-std-b67`) and enables normalisation automatically. HDR normalisation propagates explicitly through the per-chunk processing pipeline — stream-copy chunk files often lose `color_trc` metadata, which would cause the re-probe in `_auto_configure_metrics` to silently disable normalisation mid-run. This was a diagnosed and fixed production bug.
 
 ### Content Feature Extraction
 
