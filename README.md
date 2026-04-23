@@ -15,9 +15,9 @@ Source video
     │
     ├── PySceneDetect → shot boundaries
     │
-    └── Per-chunk oracle sweep
-            ├── CRF sweep [16, 18, 20, 22, 24, 26, 28]
-            ├── VMAF measurement at each CRF
+    └── Per-chunk oracle sweep  [video_quality_pipeline.py]
+            ├── Multi-lane CRF sweep (parallel encoders, single decode pass)
+            ├── In-loop VMAF measurement per lane (no separate pass)
             │     (HDR: PQ→linear→BT.709 normalisation)
             ├── Optimal CRF selection (first to exceed VMAF target)
             └── Final encode at optimal parameters
@@ -36,15 +36,27 @@ Training records (accumulated across titles)
                     │
                     └── Inference: predict optimal CRF in seconds
                             (replaces hours of trial encodes)
+                                    │
+                                    └── LadderGenerator  [ladder_generator.py]
+                                            ├── RD surface prediction
+                                            │     (resolutions × CRF values)
+                                            ├── Convex hull → Pareto-optimal rungs
+                                            ├── Per-shot CRF per rung
+                                            ├── HLS master.m3u8
+                                            ├── DASH manifest.mpd
+                                            └── --encode: multi-lane encode
+                                                  all rungs × all chunks
 ```
 
-**Three operating modes:**
+**Four operating modes:**
 
 **Standard pipeline** — encode at multiple bitrates or CRF values across the full source, measure VMAF/PSNR/SSIM at each point, produce rate-distortion curves and CSV.
 
-**Dynamic Optimizer (oracle mode)** — per-shot CRF sweep with optimal selection. Generates training data for the learned controller.
+**Dynamic Optimizer (oracle mode)** — per-shot CRF sweep with optimal selection using multi-lane parallel encoding and in-loop VMAF. Generates training data for the learned controller.
 
 **Learned Controller** — uses a trained `RDCurveModel` to predict optimal CRF from content features without a full sweep. Includes `TitleBudgetAllocator` using Lagrange optimization for bitrate budget distribution across chunks.
+
+**Ladder Generator** — generates a content-adaptive ABR bitrate ladder from a trained model. Predicts the full RD surface across resolutions and CRF values, finds the Pareto-optimal operating points via convex hull analysis, and produces HLS and DASH manifests. Optional `--encode` flag runs all renditions using multi-lane parallel encoding.
 
 ---
 
@@ -89,7 +101,49 @@ Per-chunk content features are extracted using FFmpeg `signalstats` filter with 
 
 These features feed the `RDCurveModel` regression — the model learns to predict the shape of the RD curve for new content from these four numbers, enabling fast inference without trial encodes.
 
-### RD Curve Model
+### Multi-Lane Parallel Encoding with In-Loop VMAF
+
+Meta's March 2026 engineering post describes two features now upstream in FFmpeg 8.0 that were previously only in their internal fork, both implemented in this pipeline:
+
+**Multi-lane parallel encoding** — rather than encoding each CRF variant sequentially, a single FFmpeg filter graph fans out from one decode pass to N parallel encoder instances. For a 7-point CRF sweep this reduces total decode overhead by roughly 7×.
+
+```
+Input → split=7 ─┬─ encoder[CRF 16] → output_crf16.mp4
+                 ├─ encoder[CRF 18] → output_crf18.mp4
+                 ├─ encoder[CRF 20] → output_crf20.mp4
+                 ├─ encoder[CRF 22] → output_crf22.mp4
+                 ├─ encoder[CRF 24] → output_crf24.mp4
+                 ├─ encoder[CRF 26] → output_crf26.mp4
+                 └─ encoder[CRF 28] → output_crf28.mp4
+```
+
+**In-loop VMAF measurement** — a decoder is inserted after each encoder lane and its output compared against the pre-encode reference frames. VMAF scores are produced per lane as a byproduct of the encode, eliminating the separate measurement pass entirely. For a 7-CRF sweep this replaces 14 FFmpeg invocations (7 encodes + 7 VMAF passes) with a single command.
+
+```
+Input → split=14 ─┬─ encoder[CRF 16] ─┬─ output_crf16.mp4
+                  │                    └─ decode → [dist][ref] → libvmaf → vmaf_crf16.json
+                  ├─ encoder[CRF 18] ─┬─ output_crf18.mp4
+                  │                   └─ decode → [dist][ref] → libvmaf → vmaf_crf18.json
+                  └─ ...
+```
+
+For HDR sources the PQ→linear→BT.709 normalisation chain is applied inline to both the decoded distorted output and the reference branch before libvmaf, matching the existing HDR measurement behaviour exactly. Requires FFmpeg 7.0+ for in-loop decode; falls back gracefully to sequential encode + VMAF on older versions.
+
+The `LaneSpec` dataclass provides the interface between oracle sweep logic and the encoder — CRF or bitrate, output path, optional VMAF log path, optional resolution override. All existing helper functions for quality flags, presets, pixel formats, and colour metadata are reused.
+
+### Content-Adaptive Bitrate Ladder
+
+`ladder_generator.py` generates a per-title ABR ladder from a trained `RDCurveModel`:
+
+**RD surface prediction** — predicts the full (resolution, CRF) → (VMAF, bitrate) surface across all requested rendition resolutions and CRF values. Resolution scaling uses a content-aware heuristic: complex content (high SI) degrades more when downscaled than simple content, and lower resolution encoders receive a bitrate credit proportional to `scale^1.5`.
+
+**Convex hull selection** — finds the Pareto-optimal frontier of the RD surface — the set of operating points where no other point delivers higher VMAF at lower bitrate. These are the only operating points worth considering as ladder rungs.
+
+**Per-shot CRF per rung** — each rung uses per-shot CRF assignments from the RDCurveModel rather than a fixed CRF. Within rung 4 (720p, VMAF 85 target), an easy interview shot might use CRF 26 while a crowd scene uses CRF 18 — both targeting consistent perceptual quality rather than constant bitrate.
+
+**Manifest generation** — produces a standards-compliant HLS `master.m3u8` with correct `BANDWIDTH`, `AVERAGE-BANDWIDTH`, `RESOLUTION`, and `CODECS` attributes, and a DASH `manifest.mpd` with `AdaptationSet` / `Representation` structure per rung.
+
+**Multi-lane ladder encoding** — the `--encode` flag encodes all renditions using `encode_multilane_with_vmaf()`. Each chunk is encoded across all rungs simultaneously in one FFmpeg invocation, with VMAF measured inline per rung.
 
 The `RDCurveModel` fits two parametric curves to each chunk's oracle sweep data:
 - VMAF as a function of CRF
@@ -238,6 +292,31 @@ python3 video_quality_pipeline.py source.mov \
   --output-dir ./results
 ```
 
+### Ladder Generator — content-adaptive ABR ladder
+
+```bash
+# Generate ladder from trained model (prediction only, no encoding)
+python3 ladder_generator.py source.mov \
+  --model model.json \
+  --output-dir ./ladder_output
+
+# Custom resolution set and VMAF targets
+python3 ladder_generator.py source.mov \
+  --model model.json \
+  --resolutions 360 540 720 1080 \
+  --vmaf-targets 65 75 85 92 95 \
+  --output-dir ./ladder_output
+
+# Generate and encode all renditions (multi-lane parallel)
+python3 ladder_generator.py source.mov \
+  --model model.json \
+  --resolutions 360 540 720 1080 \
+  --encode \
+  --output-dir ./ladder_output
+```
+
+Outputs: `ladder.json` (rung definitions with per-chunk CRF assignments), `master.m3u8` (HLS), `manifest.mpd` (DASH), and per-rung stub media playlists.
+
 ### Plot RD curves
 
 ```bash
@@ -278,7 +357,7 @@ The `--validate` flag will warn if source appears to be a delivery encode. A cli
 
 ## Output Files
 
-Each run produces in `--output-dir`:
+Each pipeline run produces in `--output-dir`:
 
 | File | Description |
 |---|---|
@@ -288,6 +367,17 @@ Each run produces in `--output-dir`:
 | `records.jsonl` | Training records for RDCurveModel (with `--export-training-data`) |
 | `rd_curves.png` | Rate-distortion curve plots |
 | `*_dynamic_optimized.mp4` | Final assembled output (dynamic optimizer) |
+
+Ladder generator produces in `--output-dir`:
+
+| File | Description |
+|---|---|
+| `ladder.json` | Rung definitions with per-chunk CRF assignments |
+| `master.m3u8` | HLS master playlist |
+| `manifest.mpd` | DASH MPD |
+| `{rung_label}/media.m3u8` | Per-rung HLS media playlist (stub) |
+| `{rung_label}/chunk_NNNN.mp4` | Encoded chunks per rung (with `--encode`) |
+| `{rung_label}/vmaf_NNNN.json` | Per-chunk VMAF logs per rung (with `--encode`) |
 
 ---
 
@@ -334,7 +424,9 @@ Netflix's per-title encoding (2015) and per-shot encoding (2018) established tha
 
 The learned controller extends this by replacing the expensive per-shot sweep with a fast content analysis pass — the approach needed to make per-shot optimization practical at scale where running a full CRF sweep on every chunk of every title isn't economically feasible.
 
-The content feature extraction (SI, TI, luma, luma range) provides the basis for the current model. The natural extension is richer feature representations — CNN embeddings from pretrained visual models, video transformer features — that capture content complexity properties SI and TI cannot distinguish, particularly film grain vs. structured texture, and predictable vs. chaotic motion.
+Meta's March 2026 engineering post on FFmpeg describes two features their team helped upstream into FFmpeg 7.0/8.0: threaded multi-lane encoding and in-loop real-time quality metrics. Both are implemented here. The multi-lane encoder shares a single decode pass across all CRF variants; the in-loop VMAF inserts a decoder after each encoder to measure quality without a separate pass. Together they implement the same efficiency architecture Meta uses to process over one billion video uploads per day.
+
+The content feature extraction (SI, TI, luma, luma range) provides the basis for the current model. The natural extension is richer feature representations — CNN embeddings from pretrained visual models, video transformer features — that capture content complexity properties SI and TI cannot distinguish, particularly film grain vs. structured texture, and predictable vs. chaotic motion. CLIP embeddings are a tractable near-term upgrade that would improve prediction accuracy on the edge cases where the current linear model fails.
 
 ---
 
